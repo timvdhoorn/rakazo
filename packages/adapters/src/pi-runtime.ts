@@ -11,15 +11,38 @@ import type {
 } from "@rakazo/adapter-kit";
 import { builtinAgentTools, DELEGATION_TOOL_NAMES } from "./builtin-tools.js";
 import { PiRuntimeCredentialStore, toOAuthCredential } from "./pi-credentials.js";
+import { registerLocalProvider } from "./pi-local-provider.js";
+import {
+  OPENAI_COMPATIBLE_PROVIDER_ID,
+  registerOpenAiCompatibleCatalog,
+  registerOpenAiCompatibleRuntime,
+} from "./pi-openai-compatible-provider.js";
 
 const running = new Map<string, AbortController>();
-const catalogModels = builtinModels();
+// Built on first use, not at module load: entry points call loadRootEnv() after
+// their imports, and ESM hoists those imports, so module-level env reads here
+// would run before .env is loaded and miss the local provider entirely.
+let catalogModelsCache: Models | undefined;
+function catalogModels(): Models {
+  catalogModelsCache ??= registerOpenAiCompatibleCatalog(registerLocalProvider(builtinModels()));
+  return catalogModelsCache;
+}
 const MAX_PARALLEL_SUBAGENTS = 4;
+// Reasoning-capable models must not start at "off": for OpenRouter, pi-ai maps
+// that to reasoning.effort "none", which 400s on endpoints that mandate
+// reasoning (e.g. google/gemini-3.7-flash). Keep a real level when model.reasoning
+// is set; plain models stay off.
+const REASONING_MODEL_THINKING_LEVEL = "medium";
+function thinkingLevelFor(model: { reasoning?: boolean }) {
+  return model.reasoning ? REASONING_MODEL_THINKING_LEVEL : "off";
+}
 // Pi forwards these names to OpenAI Responses, whose function-name contract is
 // ^[a-zA-Z0-9_-]+$ with a maximum length of 64 characters.
 const AGENT_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const MAX_AGENT_TOOL_NAME_LENGTH = 64;
 const FALLBACK_AGENT_TOOL_NAME = "connector_tool";
+// Bound runaway agent loops before they can issue unbounded billable tool calls.
+const MAX_TOOL_CALLS_PER_TURN = 80;
 
 export class PiAgentRuntime implements AgentRuntime {
   describe() {
@@ -45,12 +68,25 @@ export class PiAgentRuntime implements AgentRuntime {
       try {
         const provider =
           request.model.provider === "scripted" ? "openrouter" : request.model.provider;
+        const envDefaultModel = process.env.PI_DEFAULT_MODEL?.trim();
+        const envDefaultProvider = process.env.PI_DEFAULT_PROVIDER?.trim() || "openrouter";
         const modelId =
           request.model.id === "scripted"
-            ? (process.env.PI_DEFAULT_MODEL ?? "deepseek/deepseek-v4-flash-0731")
-            : request.model.id;
+            ? envDefaultModel || "deepseek/deepseek-v4-flash-0731"
+            : request.model.id.trim();
         const models = modelsForRequest(request, provider);
-        const model = models.getModel(provider, modelId) ?? models.getModel("openrouter", modelId);
+        let model = models.getModel(provider, modelId);
+        if (!model && provider !== "openrouter" && provider !== OPENAI_COMPATIBLE_PROVIDER_ID) {
+          model = models.getModel("openrouter", modelId);
+        }
+        if (
+          !model &&
+          provider === "openrouter" &&
+          envDefaultProvider === "openrouter" &&
+          modelId === envDefaultModel
+        ) {
+          model = configuredOpenRouterModel(modelId);
+        }
         if (!model) {
           queue.push({ type: "text", text: `Unknown model ${provider}/${modelId}` });
           queue.push({ type: "done" });
@@ -59,7 +95,9 @@ export class PiAgentRuntime implements AgentRuntime {
 
         const apiKey = request.model.oauth
           ? undefined
-          : (request.model.apiKey ?? process.env.OPENROUTER_API_KEY);
+          : request.model.provider === OPENAI_COMPATIBLE_PROVIDER_ID
+            ? request.model.apiKey || "local"
+            : (request.model.apiKey ?? process.env.OPENROUTER_API_KEY);
         const toolDefs = request.tools.length ? request.tools : builtinAgentTools;
         const nestedAgents = new Set<Agent>();
         const host: ToolHost = {
@@ -70,6 +108,8 @@ export class PiAgentRuntime implements AgentRuntime {
           apiKey,
           nestedAgents,
           subagentGate: createGate(MAX_PARALLEL_SUBAGENTS),
+          toolCallBudget: { count: 0, exceeded: false },
+          abortTurn: () => undefined,
           signal,
           depth: 0,
         };
@@ -87,30 +127,47 @@ export class PiAgentRuntime implements AgentRuntime {
                 ? "You are a Rakazo bot with a real computer. Use computer_observe and computer_act to operate its visible desktop, including browsers and installed applications. Use shell and the file tools for precise terminal and filesystem work. The user may interact with the same desktop while you run, so re-observe when the screen may have changed. Be concise."
                 : "You are a Rakazo bot with a persistent sandbox filesystem and shell. Be concise."),
             model,
-            thinkingLevel: "off",
+            thinkingLevel: thinkingLevelFor(model),
             tools,
             messages: history,
           },
         });
 
-        if (signal.aborted) {
-          queue.push({ type: "done", text: "stopped" });
-          return;
-        }
         const onAbort = () => {
           agent.abort();
           for (const nested of nestedAgents) nested.abort();
         };
+        host.abortTurn = onAbort;
+        if (signal.aborted) {
+          queue.push({ type: "done", text: "stopped" });
+          return;
+        }
         signal.addEventListener("abort", onAbort);
 
         let streamed = "";
+        let toolActivityShowing = false;
         agent.subscribe((event) => {
+          if (event.type === "tool_execution_start") {
+            if (!consumeToolCall(host)) return;
+            // Live activity feedback: without this the thread shows a bare
+            // "working…" for the whole tool call with nothing actionable.
+            toolActivityShowing = true;
+            queue.push({
+              type: "progress",
+              text: describeToolActivity(event.toolName, event.args),
+            });
+          }
           if (
             event.type === "message_update" &&
             event.assistantMessageEvent.type === "text_delta"
           ) {
             const delta = event.assistantMessageEvent.delta;
             if (delta) {
+              if (toolActivityShowing) {
+                // Real text replaces the activity line instead of appending to it.
+                toolActivityShowing = false;
+                queue.push({ type: "progress", text: "" });
+              }
               streamed += delta;
               queue.push({ type: "text", text: delta });
             }
@@ -133,10 +190,19 @@ export class PiAgentRuntime implements AgentRuntime {
           }
         });
 
-        queue.push({ type: "progress", text: "working…" });
-        await agent.prompt(request.prompt);
-        await agent.waitForIdle();
-        signal.removeEventListener("abort", onAbort);
+        // No "working…" progress push here: the shell already renders its own
+        // placeholder while a run is active, and emitting one here shows two.
+        const images = request.currentTurnImages?.map((image) => ({
+          type: "image" as const,
+          data: Buffer.from(image.data).toString("base64"),
+          mimeType: image.mimeType,
+        }));
+        try {
+          await agent.prompt(request.prompt, images?.length ? images : undefined);
+          await agent.waitForIdle();
+        } finally {
+          signal.removeEventListener("abort", onAbort);
+        }
 
         const error = agent.state.errorMessage;
         if (error) {
@@ -168,18 +234,56 @@ export class PiAgentRuntime implements AgentRuntime {
   }
 }
 
-function modelsForRequest(request: AgentRunRequest, provider: string): Models {
-  const oauth = request.model.oauth;
-  if (!oauth) return catalogModels;
+function configuredOpenRouterModel(id: string): Model<"openai-completions"> {
+  // A configured model can intentionally be newer than Pi's static catalog. Keep
+  // pricing conservative, but enable reasoning: unknown OpenRouter endpoints
+  // (e.g. gemini-3.7-flash before the snapshot catches up) often mandate it, and
+  // thinkingLevel "off" becomes effort "none" which those endpoints reject.
+  return {
+    id,
+    name: id,
+    api: "openai-completions",
+    provider: "openrouter",
+    baseUrl: "https://openrouter.ai/api/v1",
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 16_384,
+    maxTokens: 4_096,
+  };
+}
 
-  const persist = oauth.persist;
-  return builtinModels({
-    credentials: new PiRuntimeCredentialStore(
-      provider,
-      toOAuthCredential(oauth.credential),
-      persist ? (next) => persist(next) : undefined,
-    ),
-  });
+export function modelsForRequest(
+  request: Pick<AgentRunRequest, "model">,
+  provider: string,
+): Models {
+  const oauth = request.model.oauth;
+  if (oauth) {
+    const persist = oauth.persist;
+    return registerOpenAiCompatibleCatalog(
+      registerLocalProvider(
+        builtinModels({
+          credentials: new PiRuntimeCredentialStore(
+            provider,
+            toOAuthCredential(oauth.credential),
+            persist ? (next) => persist(next) : undefined,
+          ),
+        }),
+      ),
+    );
+  }
+  if (
+    provider === OPENAI_COMPATIBLE_PROVIDER_ID &&
+    request.model.baseUrl &&
+    request.model.id.trim()
+  ) {
+    const models = registerOpenAiCompatibleCatalog(registerLocalProvider(builtinModels()));
+    return registerOpenAiCompatibleRuntime(models, {
+      modelId: request.model.id,
+      baseUrl: request.model.baseUrl,
+    });
+  }
+  return catalogModels();
 }
 
 function toAgentTools(toolDefs: readonly ConnectorTool[], host: ToolHost): AgentTool[] {
@@ -206,6 +310,34 @@ export function normalizeAgentToolName(name: string): string {
  * Existing valid names are reserved first so sanitizing a connector cannot
  * rename or shadow a builtin tool with the same valid name.
  */
+const ACTIVITY_DETAIL_LIMIT = 90;
+
+/** One human-readable line describing a tool call, shown live in the thread. */
+export function describeToolActivity(toolName: string, args: unknown): string {
+  const record = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
+  const detail = (value: unknown): string => {
+    const text = sanitizeSensitiveText(String(value ?? ""))
+      .replaceAll(/\s+/g, " ")
+      .trim();
+    return text.length > ACTIVITY_DETAIL_LIMIT ? `${text.slice(0, ACTIVITY_DETAIL_LIMIT)}…` : text;
+  };
+  if (toolName === "shell") return `Running: ${detail(record.command)}`;
+  if (toolName === "read_file") return `Reading ${detail(record.path)}`;
+  if (toolName === "write_file") return `Writing ${detail(record.path)}`;
+  if (toolName === "list_files") return `Listing ${detail(record.path ?? ".")}`;
+  if (toolName === "attach_file") return `Attaching ${detail(record.path)}`;
+  if (toolName === "open_path") return `Opening ${detail(record.path)}`;
+  if (toolName === "render_plot") return "Rendering a chart";
+  if (toolName === "add_mcp_server") return `Connecting MCP server: ${detail(record.name)}`;
+  if (toolName === "computer_observe") return "Looking at the screen";
+  if (toolName === "computer_act") return "Operating the computer";
+  if (toolName === "run_subagent") return `Delegating to helper: ${detail(record.name)}`;
+  if (toolName === "remember") return "Saving a note to memory";
+  const mcp = toolName.match(/^mcp__(.+?)__(.+)$/);
+  if (mcp) return `Using ${mcp[1]}: ${mcp[2]}`;
+  return `Using ${toolName}`;
+}
+
 export function normalizeAgentToolNames(tools: readonly ConnectorTool[]): string[] {
   const reservedValidNames = new Set(
     tools.filter((tool) => isProviderSafeAgentToolName(tool.name)).map((tool) => tool.name),
@@ -356,7 +488,9 @@ function toAgentTool(tool: ConnectorTool, host: ToolHost, exposedName: string): 
         };
       }
       if (host.request.executeTool) {
-        const result = await host.request.executeTool(tool.name, args, executionId);
+        const result = tool.route
+          ? await host.request.executeTool(tool.name, args, executionId, tool.route)
+          : await host.request.executeTool(tool.name, args, executionId);
         if (isAgentToolExecutionResult(result)) return result;
         return {
           content: [{ type: "text", text: summarizeToolResult(result) }],
@@ -408,7 +542,7 @@ async function executeSubagent(host: ToolHost, executionId: string, args: Record
         .filter(Boolean)
         .join(" "),
       model: host.model,
-      thinkingLevel: "off",
+      thinkingLevel: thinkingLevelFor(host.model),
       tools: toAgentTools(childDefs, nestedHost),
       messages: [],
     },
@@ -419,6 +553,7 @@ async function executeSubagent(host: ToolHost, executionId: string, args: Record
   let lastPush = 0;
   nested.subscribe((event) => {
     if (event.type === "tool_execution_start") {
+      if (!consumeToolCall(host)) return;
       const toolName = "toolName" in event && event.toolName ? String(event.toolName) : "a tool";
       host.queue.push({
         type: "subagent",
@@ -663,13 +798,22 @@ function assistantText(message: unknown): string {
     .join("");
 }
 
-function sanitizeError(message: string) {
+function sanitizeSensitiveText(message: string) {
   return message
     .replace(/sk-or-v1-[a-zA-Z0-9]+/g, "[redacted]")
     .replace(/sk-[a-zA-Z0-9-]+/g, "[redacted]")
-    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/Bearer\s+[^\s"',;&]+/gi, "Bearer [redacted]")
     .replace(/eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/g, "[redacted]")
-    .replace(/COMPOSIO_API_KEY[=:]?\s*\S+/gi, "COMPOSIO_API_KEY=[redacted]");
+    .replace(/COMPOSIO_API_KEY[=:]?\s*\S+/gi, "COMPOSIO_API_KEY=[redacted]")
+    .replace(
+      /((?:api[_-]?key|access[_-]?token|password|secret)\s*[=:]\s*)[^\s"',;&]+/gi,
+      "$1[redacted]",
+    )
+    .replace(/((?:auth|authorization)\s*[=:]\s*)(?!Bearer\b)[^\s"',;&]+/gi, "$1[redacted]");
+}
+
+function sanitizeError(message: string) {
+  return sanitizeSensitiveText(message);
 }
 
 interface EventQueue {
@@ -686,8 +830,24 @@ interface ToolHost {
   apiKey: string | undefined;
   nestedAgents: Set<Agent>;
   subagentGate: { acquire(): Promise<void>; release(): void };
+  toolCallBudget: { count: number; exceeded: boolean };
+  abortTurn(): void;
   signal: AbortSignal;
   depth: number;
+}
+
+function consumeToolCall(host: ToolHost): boolean {
+  host.toolCallBudget.count += 1;
+  if (host.toolCallBudget.count <= MAX_TOOL_CALLS_PER_TURN) return true;
+  if (!host.toolCallBudget.exceeded) {
+    host.toolCallBudget.exceeded = true;
+    host.queue.push({
+      type: "progress",
+      text: `Stopped: more than ${MAX_TOOL_CALLS_PER_TURN} tool calls in one turn.`,
+    });
+  }
+  host.abortTurn();
+  return false;
 }
 
 function createGate(max: number) {

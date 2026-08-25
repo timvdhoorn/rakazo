@@ -5,6 +5,7 @@ export const DELEGATION_TOOL_NAMES = new Set([
   "spawn_bot",
   "archive_bot",
   "delete_bot",
+  "handoff_to_bot",
 ]);
 
 export const builtinAgentTools: ConnectorTool[] = [
@@ -83,6 +84,16 @@ export const builtinAgentTools: ConnectorTool[] = [
     },
   },
   {
+    name: "attach_file",
+    description:
+      "Attach a workspace file from this bot's home to the chat thread as an image or common file. The file stays in place; users can open it from the message.",
+    inputSchema: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+    },
+  },
+  {
     name: "shell",
     description:
       "Run a command inside this bot's computer. cwd defaults to the bot's folder on a Team Computer and the workspace root on a Private Computer.",
@@ -126,6 +137,96 @@ export const builtinAgentTools: ConnectorTool[] = [
       type: "object",
       properties: { reason: { type: "string" } },
       required: ["reason"],
+    },
+  },
+  {
+    name: "render_plot",
+    description:
+      'Render a chart from tabular data as a PNG and attach it to the chat. Backed by Observable Plot: bar, line, area, scatter, histogram, heatmap, box plot, facets, and more via a declarative JSON spec. Call with {"charts": true} FIRST to list every chart type with a complete runnable example spec ({"charts": "<keyword>"} searches), then copy the closest example and substitute your rows and columns. {"help": true} returns the full guide. Pass rows inline as data, or data_path for a .csv/.tsv/.json file in your home.',
+    inputSchema: {
+      type: "object",
+      properties: {
+        charts: {
+          description:
+            'true lists all chart types with runnable example specs; a keyword string (e.g. "distribution", "share", "trend") searches them.',
+        },
+        help: {
+          type: "boolean",
+          description: "Return the full render_plot skill guide instead of rendering.",
+        },
+        spec: {
+          type: "object",
+          description:
+            "Declarative Observable Plot spec: {title?, width?, height?, x?, y?, color?, fx?, fy?, marks: [{type, options, transform?, data?}]}.",
+        },
+        data: {
+          type: "array",
+          description: "Rows as objects, shared by marks without their own data.",
+        },
+        data_path: {
+          type: "string",
+          description:
+            "Workspace path of a .csv, .tsv, or .json rows file to load instead of inline data.",
+        },
+        path: {
+          type: "string",
+          description: "Output PNG path in this bot's home. Default charts/plot-<n>.png.",
+        },
+        attach: {
+          type: "boolean",
+          description: "Attach the rendered PNG to the chat (default true).",
+        },
+      },
+    },
+  },
+  {
+    name: "add_mcp_server",
+    description:
+      "Connect an MCP tool server to this workspace when the user asks you to add one and provides the details (URL or command, optional token/headers/env). The server is created immediately and assigned to you. If it needs browser OAuth authorization, an approval card appears in the chat for the user to complete — tell them to click Authorize. Do not invent endpoints; only use details the user provided.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: 'Display name, e.g. "Brex".' },
+        transport: {
+          type: "string",
+          enum: ["streamable_http", "sse", "stdio"],
+          description:
+            "streamable_http for modern HTTP servers, sse for legacy HTTP servers, stdio for local commands.",
+        },
+        endpoint: {
+          type: "string",
+          description: "HTTPS URL of the remote MCP server (required unless transport is stdio).",
+        },
+        command: {
+          type: "string",
+          description:
+            "Executable path for stdio transport (required for stdio). Must be allowlisted by the deployment.",
+        },
+        args: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Arguments for the stdio command. A single space-separated string also works.",
+        },
+        env: {
+          type: "object",
+          description: 'Environment variables for stdio transport, e.g. {"API_KEY": "..."}.',
+        },
+        headers: {
+          type: "object",
+          description: 'HTTP headers for remote transports, e.g. {"Authorization": "Bearer ..."}.',
+        },
+        secret: {
+          type: "string",
+          description: "Static access token, equivalent to an Authorization: Bearer header.",
+        },
+        assign_to_self: {
+          type: "boolean",
+          description:
+            "Assign the server to you so its tools are usable in this conversation (default true).",
+        },
+      },
+      required: ["name", "transport"],
     },
   },
   {
@@ -193,6 +294,23 @@ export const builtinAgentTools: ConnectorTool[] = [
         },
       },
       required: ["confirm_name"],
+    },
+  },
+  {
+    name: "handoff_to_bot",
+    description:
+      "In a group chat only: hand the next stage to another current member. Appends a visible handoff in the shared thread and starts that bot asynchronously.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot_id: { type: "string", description: "Target member bot id." },
+        confirm_name: {
+          type: "string",
+          description: "Exact name of the target member when bot_id is omitted.",
+        },
+        message: { type: "string", description: "What the receiving bot should do next." },
+      },
+      required: ["message"],
     },
   },
 ];

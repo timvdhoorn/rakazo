@@ -24,6 +24,10 @@ apps/mobile/ios
 packages/db/src/generated
 infra/sandboxes/supervisor/dist
 *.log
+__pycache__/
+*.py[cod]
+.syncthing.*.tmp
+*.sync-conflict-*
 .vercel
 .cache
 artifacts
